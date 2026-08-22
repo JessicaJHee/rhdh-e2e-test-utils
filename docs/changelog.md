@@ -2,7 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2.1.9] - Current
+## [2.1.10] - Current
+
+### Fixed
+
+- **Auth provider dynamic plugins**: Guest, GitHub, and Keycloak (OIDC) auth profiles now enable the matching dynamic plugins. Auth providers are no longer installed statically.
+
+## [2.1.9]
 
 ### Changed
 
