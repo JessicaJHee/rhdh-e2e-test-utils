@@ -2,7 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2.1.10] - Current
+## [2.1.11] - Current
+
+### Fixed
+
+- **GitHub auth profile missing sign-in resolver**: The GitHub auth profile now ships `usernameMatchingUserEntityName` under `auth.providers.github.production.signIn.resolvers` in both `app-config.yaml` and `dynamic-plugins.yaml`.
+
+## [2.1.10]
 
 ### Fixed
 
