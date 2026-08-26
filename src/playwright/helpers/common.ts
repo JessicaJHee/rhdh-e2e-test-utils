@@ -1,11 +1,131 @@
 import { UIhelper } from "./ui-helper.js";
 import { authenticator } from "otplib";
 import { test, expect } from "@playwright/test";
-import type { Browser, Page, TestInfo } from "@playwright/test";
+import type { Browser, BrowserContext, Page, TestInfo } from "@playwright/test";
 import { SETTINGS_PAGE_COMPONENTS } from "../page-objects/page-obj.js";
 import * as path from "path";
 import * as fs from "fs";
+import lockfile from "proper-lockfile";
 import { DEFAULT_USERS } from "../../deployment/keycloak/constants.js";
+
+/**
+ * Where a GitHub storage state is cached, and the lock that serialises access to it.
+ *
+ * The name used to be a bare relative `authState_<user>.json`, resolved against
+ * `process.cwd()` — which the worker fixture sets to the workspace's `e2e-tests`
+ * directory, the same value for every project in that workspace. So every lane and
+ * every worker shared one file with no lock: a reader could land mid-write and fail on
+ * truncated JSON, and a stale file could survive into a run that needed a fresh login.
+ *
+ * Deliberately still one file per *user*, not per project. Scoping it per project was
+ * the obvious fix and is the wrong one: `logintoGithub` derives its 2FA code from a
+ * single shared TOTP secret, so two lanes logging in inside the same 30-second window
+ * submit the identical code and GitHub rejects the second — a failure this file already
+ * has retry handling for. Sharing the session is the point of caching it; what was
+ * missing was making concurrent access safe, which is what the lock and the atomic
+ * write below do. RHDH cookies from another lane are harmless: each lane's RHDH lives
+ * on its own namespace hostname, so they are never sent anywhere they matter.
+ */
+export function githubSessionFile(userid: string): string {
+  const safe = String(userid).replace(/[^a-zA-Z0-9._-]/g, "_");
+  return path.resolve(`authState_${safe}.json`);
+}
+
+/**
+ * Cookies from a stored session, or `undefined` when there is nothing usable.
+ *
+ * A cached session is an optimisation, so a missing, truncated or malformed file must
+ * fall through to a full login rather than fail the test. Before this, a partially
+ * written file threw out of `JSON.parse` and read as a plugin failure.
+ */
+export type StoredCookies = Parameters<BrowserContext["addCookies"]>[0];
+
+export function readStoredCookies(file: string): StoredCookies | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const cookies = parsed?.cookies as StoredCookies | undefined;
+    return Array.isArray(cookies) && cookies.length > 0 ? cookies : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Writes the storage state so a concurrent reader never sees a partial file.
+ *
+ * `storageState({ path })` writes in place, so a reader can observe the file between
+ * create and write. Writing to a temp name and renaming makes the appearance of the
+ * final path atomic. The temp name carries the pid because Playwright workers are
+ * separate processes, and it is removed even when the write fails so failed runs do
+ * not litter the workspace.
+ */
+export async function writeStorageStateAtomically(
+  page: Page,
+  file: string,
+): Promise<void> {
+  const pending = `${file}.${process.pid}.tmp`;
+  try {
+    await page.context().storageState({ path: pending });
+    fs.renameSync(pending, file);
+  } finally {
+    fs.rmSync(pending, { force: true });
+  }
+}
+
+/**
+ * Runs `fn` with exclusive access to the session file, across workers and lanes.
+ *
+ * Without this the first lane to start would not have finished writing before the
+ * others decided there was no session and each began its own login — which is the
+ * TOTP collision described above, not merely wasted work. The lock target is created
+ * rather than assumed: `proper-lockfile` needs an existing path, and the session file
+ * itself does not exist on the run that has to create it.
+ */
+export async function withGithubSessionLock<T>(
+  file: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const target = `${file}.lock-target`;
+  fs.writeFileSync(target, "", { flag: "a" });
+  const release = await lockfile.lock(target, {
+    retries: { retries: 60, minTimeout: 1_000 },
+    stale: 300_000,
+  });
+  try {
+    return await fn();
+  } finally {
+    await release();
+  }
+}
+
+/**
+ * Creates the shared GitHub session if it is missing, and says which happened.
+ *
+ * Only creation needs to be exclusive: it drives a real GitHub sign-in whose 2FA
+ * code comes from one shared TOTP secret, so two lanes doing it inside the same
+ * 30-second window submit the identical code and the second is rejected. Reusing
+ * an existing session is just cookies plus a Sign In click against a different
+ * namespace host, and serialising that behind the lock made every lane queue for
+ * a sign-in it did not need — long enough that a waiter could exhaust Playwright's
+ * default test timeout before the lock's own retries ran out. `test.setTimeout`
+ * is raised inside the login itself, which is precisely the path a waiter is not on.
+ *
+ * The re-read inside the lock is what keeps that safe: whoever held the lock before
+ * us has almost certainly just created the session, and logging in again would be
+ * the same collision the lock exists to prevent.
+ */
+export async function ensureGithubSession(
+  file: string,
+  create: () => Promise<void>,
+): Promise<"reused" | "created"> {
+  if (readStoredCookies(file)) return "reused";
+
+  return await withGithubSessionLock(file, async () => {
+    if (readStoredCookies(file)) return "reused";
+    await create();
+    return "created";
+  });
+}
 
 export class LoginHelper {
   page: Page;
@@ -102,54 +222,66 @@ export class LoginHelper {
   async loginAsGithubUser(
     userid: string = process.env.VAULT_GH_USER_ID as string,
   ) {
-    const sessionFileName = `authState_${userid}.json`;
-
-    // Check if a session file for this specific user already exists
-    if (fs.existsSync(sessionFileName)) {
-      // Load and reuse existing authentication state
-      const cookies = JSON.parse(
-        fs.readFileSync(sessionFileName, "utf-8"),
-      ).cookies;
-      await this.page.context().addCookies(cookies);
-      console.log(`Reusing existing authentication state for user: ${userid}`);
-      await this.page.goto("/");
-      await this.uiHelper.waitForLoad(12000);
-      await this.uiHelper.clickButton("Sign In");
-
-      // Wait for either: sidebar appears (auto-login) or popup opens (needs auth)
-      const navPromise = this.page
-        .waitForSelector("nav a", { timeout: 15_000 })
-        .then(() => "nav" as const)
-        .catch(() => null);
-
-      const popupPromise = this.page
-        .waitForEvent("popup", { timeout: 15_000 })
-        .then((popup) => ({ popup }))
-        .catch(() => null);
-
-      const result = await Promise.race([navPromise, popupPromise]);
-
-      if (result === null) {
-        throw new Error(
-          "GitHub login failed: neither sidebar nor popup appeared after Sign In — session file may be stale",
-        );
-      }
-
-      if (typeof result === "object" && "popup" in result) {
-        // Popup opened — handle reauthorization
-        await this.handleGithubPopupReauth(result.popup);
-      }
-    } else {
-      // Perform login if no session file exists, then save the state
-      await this.logintoGithub(userid);
-      await this.page.goto("/");
-      await this.uiHelper.waitForLoad(240000);
-      await this.uiHelper.clickButton("Sign In");
-      await this.checkAndReauthorizeGithubApp();
-      await this.page.waitForSelector("nav a", { timeout: 10_000 });
-      await this.page.context().storageState({ path: sessionFileName });
-      console.log(`Authentication state saved for user: ${userid}`);
+    const sessionFileName = githubSessionFile(userid);
+    const outcome = await ensureGithubSession(sessionFileName, () =>
+      this._createGithubSession(userid, sessionFileName),
+    );
+    // Creating already left this page signed in; replaying the reuse path would
+    // click Sign In a second time against a session that is already live.
+    if (outcome === "reused") {
+      await this._reuseGithubSession(userid, sessionFileName);
     }
+  }
+
+  private async _reuseGithubSession(userid: string, sessionFileName: string) {
+    const cookies = readStoredCookies(sessionFileName);
+    if (!cookies) {
+      throw new Error(
+        `GitHub session file for ${userid} disappeared between the check and the read: ${sessionFileName}`,
+      );
+    }
+
+    // Load and reuse existing authentication state
+    await this.page.context().addCookies(cookies);
+    console.log(`Reusing existing authentication state for user: ${userid}`);
+    await this.page.goto("/");
+    await this.uiHelper.waitForLoad(12000);
+    await this.uiHelper.clickButton("Sign In");
+
+    // Wait for either: sidebar appears (auto-login) or popup opens (needs auth)
+    const navPromise = this.page
+      .waitForSelector("nav a", { timeout: 15_000 })
+      .then(() => "nav" as const)
+      .catch(() => null);
+
+    const popupPromise = this.page
+      .waitForEvent("popup", { timeout: 15_000 })
+      .then((popup) => ({ popup }))
+      .catch(() => null);
+
+    const result = await Promise.race([navPromise, popupPromise]);
+
+    if (result === null) {
+      throw new Error(
+        "GitHub login failed: neither sidebar nor popup appeared after Sign In — session file may be stale",
+      );
+    }
+
+    if (typeof result === "object" && "popup" in result) {
+      // Popup opened — handle reauthorization
+      await this.handleGithubPopupReauth(result.popup);
+    }
+  }
+
+  private async _createGithubSession(userid: string, sessionFileName: string) {
+    await this.logintoGithub(userid);
+    await this.page.goto("/");
+    await this.uiHelper.waitForLoad(240000);
+    await this.uiHelper.clickButton("Sign In");
+    await this.checkAndReauthorizeGithubApp();
+    await this.page.waitForSelector("nav a", { timeout: 10_000 });
+    await writeStorageStateAtomically(this.page, sessionFileName);
+    console.log(`Authentication state saved for user: ${userid}`);
   }
 
   async checkAndReauthorizeGithubApp() {
