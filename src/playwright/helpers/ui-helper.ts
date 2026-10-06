@@ -589,7 +589,9 @@ export class UIhelper {
       .filter({ hasText: message })
       .or(this.page.getByRole("alert").filter({ hasText: message }))
       .or(this.page.getByText(message));
-    await expect(alert.first()).toBeVisible({ timeout: 30_000 });
+    await expect(alert.filter({ visible: true }).first()).toBeVisible({
+      timeout: 30_000,
+    });
   }
 
   async verifyTextInTooltip(text: string | RegExp) {
